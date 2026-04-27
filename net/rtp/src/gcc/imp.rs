@@ -461,6 +461,9 @@ impl Detector {
     }
 
     fn rtt(&self) -> Duration {
+        if self.rtts.is_empty() {
+            return Duration::ZERO;
+        }
         Duration::nanoseconds(
             (self
                 .rtts
@@ -1341,6 +1344,13 @@ impl ObjectImpl for BandwidthEstimator {
                     .blurb("How to calculate the delay estimate that will be compared against the dynamic delay threshold.")
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecInt::builder("round-trip-time-ms")
+                    .nick("Round Trip Time")
+                    .blurb("Current moving-average round trip time estimate in milliseconds derived from TWCC feedback")
+                    .minimum(0)
+                    .maximum(i32::MAX)
+                    .read_only()
+                    .build(),
             ]
         });
 
@@ -1390,6 +1400,11 @@ impl ObjectImpl for BandwidthEstimator {
             "estimator" => {
                 let state = self.state.lock().unwrap();
                 state.estimator.to_value()
+            }
+            "round-trip-time-ms" => {
+                let state = self.state.lock().unwrap();
+                let rtt_ms = state.detector.rtt().whole_milliseconds();
+                (rtt_ms.clamp(0, i32::MAX as i128) as i32).to_value()
             }
             _ => unimplemented!(),
         }

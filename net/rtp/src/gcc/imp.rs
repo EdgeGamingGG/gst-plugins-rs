@@ -131,6 +131,8 @@ struct Packet {
     seqnum: u64,
 }
 
+const TWCC_PACKED_PACKET_SIZE: usize = 24;
+
 fn human_kbits<T: Into<f64>>(bits: T) -> String {
     format!("{:.2}kb", (bits.into() / 1_000.))
 }
@@ -168,6 +170,74 @@ impl Packet {
             size: structure.get::<u32>("size").unwrap() as usize,
             seqnum,
         })
+    }
+
+    // Keep GCC's TWCC ingest compatible with the packed C-side event.  This is
+    // intentionally parsed as fixed-size records to avoid rebuilding the old
+    // per-packet GstStructure allocation path on the receive queue thread.
+    fn from_packed_structure(structure: &gst::StructureRef) -> Option<Vec<Self>> {
+        let packet_size = structure.get::<u32>("packet-size").ok()? as usize;
+        if packet_size != TWCC_PACKED_PACKET_SIZE {
+            gst::warning!(
+                CAT,
+                "Ignoring packed TWCC feedback with unexpected packet size {}",
+                packet_size
+            );
+            return None;
+        }
+
+        let bytes = structure.get::<glib::Bytes>("packets").ok()?;
+        let data = bytes.as_ref();
+        if data.len() % TWCC_PACKED_PACKET_SIZE != 0 {
+            gst::warning!(
+                CAT,
+                "Ignoring malformed packed TWCC feedback with {} bytes",
+                data.len()
+            );
+            return None;
+        }
+
+        let mut packets = Vec::with_capacity(data.len() / TWCC_PACKED_PACKET_SIZE);
+        for chunk in data.chunks_exact(TWCC_PACKED_PACKET_SIZE) {
+            let seqnum = u16::from_be_bytes([chunk[0], chunk[1]]) as u64;
+            let departure_ns = u64::from_be_bytes([
+                chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9],
+            ]);
+            let arrival_ns = u64::from_be_bytes([
+                chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15], chunk[16],
+                chunk[17],
+            ]);
+            let size = u32::from_be_bytes([chunk[18], chunk[19], chunk[20], chunk[21]]) as usize;
+            let status = chunk[22];
+
+            if departure_ns == u64::MAX || departure_ns > i64::MAX as u64 {
+                continue;
+            }
+
+            let departure = Duration::nanoseconds(departure_ns as i64);
+            if status == 0 {
+                packets.push(Packet {
+                    arrival: Duration::ZERO,
+                    departure,
+                    size,
+                    seqnum,
+                });
+                continue;
+            }
+
+            if arrival_ns == u64::MAX || arrival_ns > i64::MAX as u64 {
+                continue;
+            }
+
+            packets.push(Packet {
+                arrival: Duration::nanoseconds(arrival_ns as i64),
+                departure,
+                size,
+                seqnum,
+            });
+        }
+
+        Some(packets)
     }
 }
 
@@ -1219,54 +1289,61 @@ impl ObjectSubclass for BandwidthEstimator {
                     |this| {
                         let bwe = this.obj();
 
-                        if let Some(structure) = event.structure()
-                            && structure.name() == "RTPTWCCPackets" {
-                                let varray = structure.get::<glib::ValueArray>("packets").unwrap();
-                                let mut packets = varray
+                        if let Some(structure) = event.structure() {
+                            let mut packets = if structure.name() == "RTPTWCCPacketsPacked" {
+                                Packet::from_packed_structure(structure).unwrap_or_default()
+                            } else if structure.name() == "RTPTWCCPackets" {
+                                let varray =
+                                    structure.get::<glib::ValueArray>("packets").unwrap();
+                                varray
                                     .iter()
                                     .filter_map(|s| {
                                         Packet::from_structure(&s.get::<gst::Structure>().unwrap())
                                     })
-                                    .collect::<Vec<Packet>>();
+                                    .collect::<Vec<Packet>>()
+                            } else {
+                                Vec::new()
+                            };
 
-                                // The list of packets could be empty once parsed
-                                if !packets.is_empty() {
-                                    let mut logged_bitrates = None;
+                            // The list of packets could be empty once parsed
+                            if !packets.is_empty() {
+                                let mut logged_bitrates = None;
 
-                                    let bitrate_changed = {
-                                        let mut state = this.state.lock().unwrap();
+                                let bitrate_changed = {
+                                    let mut state = this.state.lock().unwrap();
 
-                                        state.detector.update(&mut packets);
-                                        let bitrate_updated_by_delay = state.delay_control(&bwe);
-                                        let bitrate_updated_by_loss = state.loss_control(&bwe);
-                                        let bitrate_changed = bitrate_updated_by_delay || bitrate_updated_by_loss;
-
-                                        if bitrate_changed {
-                                            // So we don't have to hold the state mutex while logging.
-                                            logged_bitrates = Some((
-                                                state.target_bitrate_on_delay,
-                                                state.target_bitrate_on_loss,
-                                            ));
-                                        }
-
-                                        bitrate_changed
-                                    };
-
-                                    if let Some(bitrates) = logged_bitrates {
-                                        gst::log!(
-                                            CAT,
-                                            obj = bwe,
-                                            "target bitrate on delay: {}ps - target bitrate on loss: {}ps",
-                                            human_kbits(bitrates.0),
-                                            human_kbits(bitrates.1),
-                                        );
-                                    }
+                                    state.detector.update(&mut packets);
+                                    let bitrate_updated_by_delay = state.delay_control(&bwe);
+                                    let bitrate_updated_by_loss = state.loss_control(&bwe);
+                                    let bitrate_changed =
+                                        bitrate_updated_by_delay || bitrate_updated_by_loss;
 
                                     if bitrate_changed {
-                                        bwe.notify("estimated-bitrate")
+                                        // So we don't have to hold the state mutex while logging.
+                                        logged_bitrates = Some((
+                                            state.target_bitrate_on_delay,
+                                            state.target_bitrate_on_loss,
+                                        ));
                                     }
+
+                                    bitrate_changed
+                                };
+
+                                if let Some(bitrates) = logged_bitrates {
+                                    gst::log!(
+                                        CAT,
+                                        obj = bwe,
+                                        "target bitrate on delay: {}ps - target bitrate on loss: {}ps",
+                                        human_kbits(bitrates.0),
+                                        human_kbits(bitrates.1),
+                                    );
+                                }
+
+                                if bitrate_changed {
+                                    bwe.notify("estimated-bitrate")
                                 }
                             }
+                        }
 
                         gst::Pad::event_default(pad, parent, event)
                     },
